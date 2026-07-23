@@ -94,11 +94,17 @@ void board_early_init(void) {
 
     // Publish spoofing status so users can query it via:
     //   fastboot getvar is-spoofing
-    fastboot_publish("is-spoofing", is_spoofing_enabled() ? "1" : "0");
+    //
+    // NOTE: board_early_init runs before env is initialized, so
+    // is_spoofing_enabled() would always return 0 here (env not ready).
+    // Since gale patches seccfg_get_lock_state unconditionally, we just
+    // report "1" always. The oem bldr_spoof command can still toggle the
+    // env var for the cmdline hook (handle_recovery_boot) which runs later.
+    fastboot_publish("is-spoofing", "1");
 
-    // Register custom fastboot command to toggle spoofing on/off at runtime:
-    //   fastboot oem bldr_spoof enable
-    //   fastboot oem bldr_spoof disable
+    // Register custom fastboot command to toggle cmdline spoofing:
+    //   fastboot oem bldr_spoof enable   -> keep verifiedbootstate=green on OS
+    //   fastboot oem bldr_spoof disable  -> expose orange/unlocked to OS
     fastboot_register("oem bldr_spoof", cmd_spoof_bootloader_lock, 0);
 }
 
