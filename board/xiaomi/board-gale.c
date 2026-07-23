@@ -96,8 +96,8 @@ static void __attribute__((naked)) spoof_lock_state_hook(void) {
         "push {r0-r3, r12, lr}\n"
         "bl spoof_lock_state\n"
         "pop {r0-r3, r12, lr}\n"
-        "movw ip, #0x0D41\n"
-        "movt ip, #0x4C40\n"
+        "movw ip, #0x12C1\n" // original bl target (0x4C4712C0) in Thumb mode
+        "movt ip, #0x4C47\n"
         "bx ip\n"
     );
 }
@@ -153,12 +153,12 @@ void board_early_init(void) {
         PATCH_MEM(load_and_verify_vbmeta_addr - 0x32C, 0x429B); // cmp r2, r3 -> cmp r3, r3
     }
 
-    // Hook env_init_done (VMA 0x4C4057FA) to run our dynamic spoofing logic
-    uint32_t storage_init_done_caller = SEARCH_PATTERN(LK_START, LK_END, 0xB00C, 0xE8BD, 0x41F0, 0xF7FB, 0xBAA1);
-    if (storage_init_done_caller) {
-        uint32_t hook_addr = storage_init_done_caller + 6;
-        printf("Found storage_init_done tail-call at 0x%08X, hooking...\n", hook_addr);
-        PATCH_BRANCH(hook_addr, (void *)spoof_lock_state_hook);
+    // Hook env_init_done in platform_init (VMA 0x4C403A18) to run our dynamic spoofing logic
+    uint32_t platform_init_hook_base = SEARCH_PATTERN(LK_START, LK_END, 0x2200, 0x2300, 0xE966, 0x2302);
+    if (platform_init_hook_base) {
+        uint32_t hook_addr = platform_init_hook_base + 8;
+        printf("Found platform_init env ready point at 0x%08X, hooking...\n", hook_addr);
+        PATCH_CALL(hook_addr, (void *)spoof_lock_state_hook, TARGET_THUMB);
     }
 
     // Hook cmdline_pre_process to restore unlocked state when booting recovery
