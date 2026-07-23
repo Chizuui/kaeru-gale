@@ -93,9 +93,9 @@ __attribute__((used)) void spoof_lock_state(void) {
 
 static void __attribute__((naked)) spoof_lock_state_hook(void) {
     asm volatile(
-        "push {r0-r3, lr}\n"
+        "push {r0-r3, r12, lr}\n"
         "bl spoof_lock_state\n"
-        "pop {r0-r3, lr}\n"
+        "pop {r0-r3, r12, lr}\n"
         "movw ip, #0x0D41\n"
         "movt ip, #0x4C40\n"
         "bx ip\n"
