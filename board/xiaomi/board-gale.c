@@ -96,7 +96,8 @@ static void __attribute__((naked)) spoof_lock_state_hook(void) {
         "push {r0-r3, lr}\n"
         "bl spoof_lock_state\n"
         "pop {r0-r3, lr}\n"
-        "ldr ip, =0x4C400D41\n" // original tail-call target (Thumb mode)
+        "movw ip, #0x0D41\n"
+        "movt ip, #0x4C40\n"
         "bx ip\n"
     );
 }
