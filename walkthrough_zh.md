@@ -10,13 +10,15 @@
 
 对 `lk.img` 进行静态分析后，`configs/xiaomi/gale_defconfig` 配置文件中关键地址的对比结果如下：
 
-| 配置参数 | 移植分析前 | 移植分析后 | 状态 / 技术说明 |
-| :--- | :--- | :--- | :--- |
-| **`CONFIG_APP_ADDRESS`** | *(空)* | **`0x4C42A3CC`** | **[新增]** 主引导应用程序的入口地址 (`app()`)。通过追踪 `fastboot continue` 命令结尾处的跳转获得。 |
-| **`CONFIG_BOOTMODE_ADDRESS`** | *(空)* | **`0x4C5765A4`** | **[新增]** RAM/BSS 中 bootmode 引导模式变量的地址。通过计算 `fastboot continue` 函数内部的相对指针获得。 |
-| **`CONFIG_FASTBOOT_FAIL_ADDRESS`** | *(空)* | **`0x4C42B820`** | **[修正]** 地址 `0x4C42B820` 最初被错误识别为 OKAY 响应，现修正为 FAIL，因为它加载了 `"FAIL"` 字符串。 |
-| **`CONFIG_FASTBOOT_OKAY_ADDRESS`** | `0x4C42B820` | **`0x4C42BA00`** | **[修正]** 更新为真实的 `fastboot_okay()` 响应函数地址（加载了 `"OKAY"` 字符串）。 |
-| **`CONFIG_PLATFORM_INIT_CALLER`** | *(空)* | **`0x4C425E0C`** | **[新增]** 在 `bootstrap2` 线程中调用硬件初始化函数 `platform_init` 的指令地址。 |
+| 配置参数 | 地址值 | 状态 / 技术说明 |
+| :--- | :--- | :--- |
+| **`CONFIG_APP_ADDRESS`** | **`0x4C42A3CC`** | **[新增]** 主引导应用程序（`app()`）的入口点。通过 `fastboot continue` 末尾的 tail-jump 追踪。 |
+| **`CONFIG_BOOTMODE_ADDRESS`** | **`0x4C5765A4`** | **[新增]** BSS 中的启动模式变量，通过 `fastboot continue` 函数内指针链定位。 |
+| **`CONFIG_FASTBOOT_FAIL_ADDRESS`** | **`0x4C42B820`** | 加载 `"FAIL"` 格式字符串（字符串搜索确认）。 |
+| **`CONFIG_FASTBOOT_OKAY_ADDRESS`** | **`0x4C42BA00`** | 加载 `"OKAY"` 格式字符串。 |
+| **`CONFIG_PLATFORM_INIT_CALLER`** | **`0x4C425E0C`** | `bootstrap2` 线程中的 `bl platform_init` 指令地址。 |
+| **`CONFIG_GET_ENV_ADDRESS`** | **`0x4C45C4E8`** | **[新增]** 公开的 `get_env(char *key)` 包装函数 — 被调用 25 次，tail-call 到 `env_lookup_with_area()`。 |
+| **`CONFIG_SET_ENV_ADDRESS`** | **`0x4C45C700`** | **[新增]** 公开的 `set_env(char *key, char *val)` 包装函数 — tail-call 到 `set_env_with_area(key, val, 0)`。 |
 
 ---
 
@@ -58,15 +60,35 @@ arm-none-eabi-objdump -m arm -M force-thumb -b binary --adjust-vma=0x4C3FFE00 -D
 
 所有的定制补丁均写入 `board/xiaomi/board-gale.c` 源码文件中：
 
-* **免除映像文件签名校验 (`get_vfy_policy`)**:
-   强制将 `0x4C417B58` 处的特征码（`0xB508, 0xF7FF, 0xFF63, 0xF3C0`）的返回值修改为 `0`（通过校验）。
-* **允许加锁状态下烧录分区 (`get_dl_policy`)**:
-   强制将 `0x4C417B64` 处的特征码（`0xB508, 0xF7FF, 0xFF5D, 0xF000`）的返回值修改为 `0`。
-* **绕过 AVB 报错防线 (`avb_slot_verify`)**:
-   将 `0x4C465E5A` 处的特征码（`0xF005, 0x0301, 0xF083, 0x0A01, 0x930D, 0x9B70`）修改替换为 `0xF04F, 0x0301`。
-* **伪装引导加载程序锁定状态 (`seccfg_get_lock_state` & AVB 命令行补丁)**:
-  1. 拦截 `0x4C471120` 处的安全锁获取函数，强制返回 `2`（未锁定），保证 Bootloader 内部功能正常闪存和引导。
-  2. 拦截 `0x4C462260` 处的 AVB 内核命令行构造函数，在其偏移量 `+ 0x9C`（地址 `0x4C4622FC`）处写入一个 16 位的 NOP，迫使其将 `"locked"` 安全状态传达给 Android 操作系统。
+* **免除签名校验 (`get_vfy_policy`)**: 强制特征码 `0xB508, 0xF7FF, 0xFF63, 0xF3C0` 返回 `0`。
+* **允许刷写分区 (`get_dl_policy`)**: 强制特征码 `0xB508, 0xF7FF, 0xFF5D, 0xF000` 返回 `0`。
+* **绕过 AVB 报错 (`avb_slot_verify`)**: 修补特征码以强制走允许路径。
+* **伪装锁定状态 (`seccfg_get_lock_state`)**: 在 `0x4C471120` 强制返回 `2`（未锁定），bootloader 允许刷写。
+* **AVB 命令行伪装**: 在 `0x4C462260 + 0x9C` 写 NOP，强制 `verifiedbootstate=green` 传入内核（正常启动时 Play Integrity 正常工作）。
+
+---
+
+## 4. Recovery 引导的命令行修复
+
+为使 TWRP / fastbootd 正确检测设备为**已解锁**状态，在进入 Recovery 模式时必须将内核命令行还原为真实的解锁状态。
+
+### 策略
+参照 `board-earth.c`：通过 `PATCH_CALL` 挂钩 `cmdline_pre_process`，在钩子函数中检测 Recovery 模式并覆写命令行缓冲区。
+
+### 关键地址（静态分析获得）
+
+| 符号 | 地址 | 定位方式 |
+| :--- | :--- | :--- |
+| `cmdline_pre_process` | `0x4C42F544` | lk.img 中的特征码 `0xE92D, 0x47F0, 0xF7FF, 0xFFA6` |
+| `g_cmdline` (CMDLINE1) | `0x4C579626` | 解码 cmdline 构造函数中的 PC 相对字面量池 |
+| 第二命令行缓冲区 (CMDLINE2) | `0x4C5795D8` | 同函数相邻字面量池 |
+
+### `handle_recovery_boot()` 的行为
+1. 检查 `get_bootmode() == BOOTMODE_RECOVERY` 且 `is_spoofing_enabled()` — 正常启动时提前返回。
+2. 对两个 BSS 缓冲区调用 `patch_cmdline()`，替换以下内容：
+   - `androidboot.verifiedbootstate=green` → `orange`
+   - `androidboot.secureboot=1` → `0`
+   - `androidboot.vbmeta.device_state=locked` → `unlocked`
 
 ---
 

@@ -10,13 +10,15 @@ This guide provides a step-by-step process of porting and customizing the `kaeru
 
 Here is the comparison of memory addresses in the `configs/xiaomi/gale_defconfig` file after performing static analysis on `lk.img`:
 
-| Config Parameter | Before Analysis | After Analysis | Status / Technical Explanation |
-| :--- | :--- | :--- | :--- |
-| **`CONFIG_APP_ADDRESS`** | *(Empty)* | **`0x4C42A3CC`** | **[NEW]** The entry point address of the main boot application (`app()`). Obtained by tracing the jump at the end of the `fastboot continue` command. |
-| **`CONFIG_BOOTMODE_ADDRESS`** | *(Empty)* | **`0x4C5765A4`** | **[NEW]** The address of the bootmode variable in RAM/BSS. Located via relative pointer calculation inside the `fastboot continue` function. |
-| **`CONFIG_FASTBOOT_FAIL_ADDRESS`** | *(Empty)* | **`0x4C42B820`** | **[CORRECTION]** Address `0x4C42B820`, initially detected as OKAY, is corrected to FAIL as it loads the `"FAIL"` string. |
-| **`CONFIG_FASTBOOT_OKAY_ADDRESS`** | `0x4C42B820` | **`0x4C42BA00`** | **[CORRECTION]** Updated to the actual `fastboot_okay()` address which loads the `"OKAY"` string. |
-| **`CONFIG_PLATFORM_INIT_CALLER`** | *(Empty)* | **`0x4C425E0C`** | **[NEW]** The address of the instruction calling `platform_init` in the `bootstrap2` thread. |
+| Config Parameter | Value | Status / Technical Explanation |
+| :--- | :--- | :--- |
+| **`CONFIG_APP_ADDRESS`** | **`0x4C42A3CC`** | **[NEW]** Entry point of the main boot application (`app()`). Traced from the tail-jump in `fastboot continue`. |
+| **`CONFIG_BOOTMODE_ADDRESS`** | **`0x4C5765A4`** | **[NEW]** Bootmode variable in BSS. Located via pointer chain in the `fastboot continue` function. |
+| **`CONFIG_FASTBOOT_FAIL_ADDRESS`** | **`0x4C42B820`** | Loads the `"FAIL"` format string (confirmed via string search). |
+| **`CONFIG_FASTBOOT_OKAY_ADDRESS`** | **`0x4C42BA00`** | Loads the `"OKAY"` format string. |
+| **`CONFIG_PLATFORM_INIT_CALLER`** | **`0x4C425E0C`** | The `bl platform_init` instruction in the `bootstrap2` thread. |
+| **`CONFIG_GET_ENV_ADDRESS`** | **`0x4C45C4E8`** | **[NEW]** Public `get_env(char *key)` wrapper — called 25× across LK, tail-calls the internal `env_lookup_with_area()`. |
+| **`CONFIG_SET_ENV_ADDRESS`** | **`0x4C45C700`** | **[NEW]** Public `set_env(char *key, char *val)` wrapper — tail-calls `set_env_with_area(key, val, 0)`. |
 
 ---
 
@@ -58,15 +60,35 @@ I searched for all branch instructions `bl` that lead to the platform initializa
 
 All customization logic is placed in `board/xiaomi/board-gale.c`:
 
-* **Disable Image Authentication (`get_vfy_policy`)**:
-   Forces pattern (`0xB508, 0xF7FF, 0xFF63, 0xF3C0`) at `0x4C417B58` to return `0`.
-* **Allow Flashing when Locked (`get_dl_policy`)**:
-   Forces pattern (`0xB508, 0xF7FF, 0xFF5D, 0xF000`) at `0x4C417B64` to return `0`.
-* **Allow AVB Errors (`avb_slot_verify`)**:
-   Patches pattern (`0xF005, 0x0301, 0xF083, 0x0A01, 0x930D, 0x9B70`) at `0x4C465E5A` with `0xF04F, 0x0301`.
-* **Bootloader Lock Spoofing (`seccfg_get_lock_state` & AVB Cmdline)**:
-  1. Patches `seccfg_get_lock_state` at `0x4C471120` to return `2` (Unlocked) so the internal bootloader runs without flashing constraints.
-  2. Patches the AVB cmdline function at `0x4C462260` by inserting a 16-bit NOP at offset `+ 0x9C` (`0x4C4622FC`). This tricks the Android OS into reporting the lock state as `"locked"`.
+* **Disable Image Authentication (`get_vfy_policy`)**: Forces `0xB508, 0xF7FF, 0xFF63, 0xF3C0` to return `0`.
+* **Allow Flashing (`get_dl_policy`)**: Forces `0xB508, 0xF7FF, 0xFF5D, 0xF000` to return `0`.
+* **Allow AVB Errors (`avb_slot_verify`)**: Patches `0xF005, 0x0301, 0xF083, 0x0A01, 0x930D, 0x9B70` to force allow-error path.
+* **Lock Spoofing (`seccfg_get_lock_state`)**: Patches at `0x4C471120` to return `2` (Unlocked) so the internal bootloader allows fastboot flashing.
+* **AVB Cmdline Spoofing**: NOP-patches the `beq.n` at `0x4C462260 + 0x9C` in the AVB cmdline function — forces `verifiedbootstate=green` into the kernel cmdline on all normal boots (Play Integrity stays happy).
+
+---
+
+## 4. Recovery Cmdline Spoofing
+
+For TWRP / fastbootd to correctly detect the device as **unlocked**, the kernel cmdline must be restored to the real unlocked state when booting into recovery.
+
+### Strategy
+Inspired by `board-earth.c`: hook `cmdline_pre_process` via `PATCH_CALL`, then detect recovery mode inside the hook and overwrite the cmdline buffers.
+
+### Key Addresses (found via static analysis)
+
+| Symbol | Address | How Found |
+| :--- | :--- | :--- |
+| `cmdline_pre_process` | `0x4C42F544` | Pattern `0xE92D, 0x47F0, 0xF7FF, 0xFFA6` in lk.img |
+| `g_cmdline` (CMDLINE1) | `0x4C579626` | Decoded PC-relative literal pool in cmdline builder |
+| Secondary cmdline (CMDLINE2) | `0x4C5795D8` | Adjacent literal pool in same function |
+
+### What `handle_recovery_boot()` does
+1. Checks `get_bootmode() == BOOTMODE_RECOVERY` and `is_spoofing_enabled()` — returns early on normal boots.
+2. Calls `patch_cmdline()` on both BSS buffers, replacing:
+   - `androidboot.verifiedbootstate=green` → `orange`
+   - `androidboot.secureboot=1` → `0`
+   - `androidboot.vbmeta.device_state=locked` → `unlocked`
 
 ---
 
