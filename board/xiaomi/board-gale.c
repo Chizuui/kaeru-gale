@@ -91,6 +91,15 @@ void board_early_init(void) {
         printf("Found cmdline_pre_process at 0x%08X\n", addr);
         PATCH_CALL(addr, (void *)handle_recovery_boot, TARGET_THUMB);
     }
+
+    // Publish spoofing status so users can query it via:
+    //   fastboot getvar is-spoofing
+    fastboot_publish("is-spoofing", is_spoofing_enabled() ? "1" : "0");
+
+    // Register custom fastboot command to toggle spoofing on/off at runtime:
+    //   fastboot oem bldr_spoof enable
+    //   fastboot oem bldr_spoof disable
+    fastboot_register("oem bldr_spoof", cmd_spoof_bootloader_lock, 0);
 }
 
 void board_late_init(void) {
