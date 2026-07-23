@@ -82,3 +82,4 @@ lib-$(CONFIG_XIAOMI_LANCELOT) += xiaomi/board-lancelot.o
 lib-$(CONFIG_XIAOMI_MERLIN) += xiaomi/board-merlin.o
 lib-$(CONFIG_XIAOMI_BEGONIA) += xiaomi/board-begonia.o
 lib-$(CONFIG_SAMSUNG_GTA7LITE) += samsung/board-gta7lite.o
+lib-$(CONFIG_XIAOMI_GALE) += xiaomi/board-gale.o
