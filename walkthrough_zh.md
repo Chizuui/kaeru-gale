@@ -58,22 +58,32 @@ arm-none-eabi-objdump -m arm -M force-thumb -b binary --adjust-vma=0x4C3FFE00 -D
 
 ## 3. 定制与锁定状态伪装 (board-gale.c)
 
-所有的定制补丁均写入 `board/xiaomi/board-gale.c` 源码文件中：
+所有的定制逻辑均写入 `board/xiaomi/board-gale.c` 源码文件中。与此前无条件的早期修改不同，我们通过挂钩环境初始化完成时（`env_init_done`）的代码，根据环境变量 `is_spoofing_enabled()` 的状态（`1` 或 `0`）动态应用各种补丁。
 
-* **免除签名校验 (`get_vfy_policy`)**: 强制特征码 `0xB508, 0xF7FF, 0xFF63, 0xF3C0` 返回 `0`。
-* **允许刷写分区 (`get_dl_policy`)**: 强制特征码 `0xB508, 0xF7FF, 0xFF5D, 0xF000` 返回 `0`。
-* **绕过 AVB 报错 (`avb_slot_verify`)**: 修补特征码以强制走允许路径。
-* **伪装锁定状态 (`seccfg_get_lock_state`)**: 在 `0x4C471120` 强制返回 `2`（未锁定），bootloader 允许刷写。
-* **AVB 命令行伪装**: 在 `0x4C462260 + 0x9C` 写 NOP，强制 `verifiedbootstate=green` 传入内核（正常启动时 Play Integrity 正常工作）。
+### 挂钩环境初始化完成 (Env Init Done)
+由于环境变量在 `board_early_init` 运行期间尚未就绪，我们通过 `PATCH_BRANCH` 挂钩存储初始化函数的 tail-call 调用（`0x4C4057FA`），使其跳转至 `spoof_lock_state_hook()`，从而在此处运行我们的动态配置。
+
+### 当启用伪装时 (`bldr_spoof` 设为 "1")
+* **伪装锁定状态 (`seccfg_get_lock_state`)**: 在 `0x4C471120 + 6` 处修改函数体，向指针写入 `1`（已锁定），从而欺骗 TEE 和 Android OS。
+* **AVB 命令行伪装**: 在 `0x4C462260 + 0x9C` 写入 NOP，强制在所有正常启动时向内核命令行传入 `verifiedbootstate=green`。
+* **绕过 Fastboot 安全门槛**: 在 fastboot 命令行处理器 (`0x4C42B830`) 的 `cbz` 门槛和 `bl fastboot_fail` 指令处写入 NOP，使得设备在报告“已锁定”状态时，仍可正常执行 fastboot 刷写和擦除操作。
+* **绕过 AVB 链式公钥验证 (`load_and_verify_vbmeta`)**: NOP 掉 `0x4C464CF8` 处的 `bne.w` 报错跳转，修补 `0x4C4649CC` 处的 `cmp r2, r3` 为 `cmp r3, r3`（强制跳过公钥长度检查），并修补 `0x4C464D6A` 处的 `cmp r3, #0` 为 `movs r3, #1`（强制将该公钥标记为信任）。这允许加载和启动未签名的 modem 和其他固件镜像。
+
+### 当禁用伪装时 (`bldr_spoof` 设为 "0")
+* **伪装锁定状态 (`seccfg_get_lock_state`)**: 修改函数体以返回 `2`（未锁定），使 TEE、Android OS 和 fastboot 将设备识别为完全解锁状态。
+* **其他补丁**: 被跳过，因此设备将以其真实的未锁定状态引导启动。
 
 ---
 
 ## 4. Recovery 引导的命令行修复
 
-为使 TWRP / fastbootd 正确检测设备为**已解锁**状态，在进入 Recovery 模式时必须将内核命令行还原为真实的解锁状态。
+为使 TWRP / fastbootd 正确检测设备为**已解锁**状态（在启用伪装时），在进入 Recovery 模式时必须将内核命令行还原为真实的解锁状态。
 
 ### 策略
-参照 `board-earth.c`：通过 `PATCH_CALL` 挂钩 `cmdline_pre_process`，在钩子函数中检测 Recovery 模式并覆写命令行缓冲区。
+通过 `PATCH_CALL` 挂钩 `cmdline_pre_process`。如果满足 `get_bootmode() == BOOTMODE_RECOVERY` 且已启用伪装，`handle_recovery_boot()` 将替换以下内容：
+- `androidboot.verifiedbootstate=green` → `orange`
+- `androidboot.secureboot=1` → `0`
+- `androidboot.vbmeta.device_state=locked` → `unlocked`
 
 ### 关键地址（静态分析获得）
 
@@ -83,16 +93,9 @@ arm-none-eabi-objdump -m arm -M force-thumb -b binary --adjust-vma=0x4C3FFE00 -D
 | `g_cmdline` (CMDLINE1) | `0x4C579626` | 解码 cmdline 构造函数中的 PC 相对字面量池 |
 | 第二命令行缓冲区 (CMDLINE2) | `0x4C5795D8` | 同函数相邻字面量池 |
 
-### `handle_recovery_boot()` 的行为
-1. 检查 `get_bootmode() == BOOTMODE_RECOVERY` 且 `is_spoofing_enabled()` — 正常启动时提前返回。
-2. 对两个 BSS 缓冲区调用 `patch_cmdline()`，替换以下内容：
-   - `androidboot.verifiedbootstate=green` → `orange`
-   - `androidboot.secureboot=1` → `0`
-   - `androidboot.vbmeta.device_state=locked` → `unlocked`
-
 ---
 
-## 4. 重新编译与构建
+## 5. 重新编译与构建
 ```bash
 ./build.sh gale lk.img
 ```

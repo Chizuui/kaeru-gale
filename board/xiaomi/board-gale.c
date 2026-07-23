@@ -35,6 +35,72 @@ static void handle_recovery_boot(void) {
     }
 }
 
+static uint32_t seccfg_addr = 0;
+static uint32_t avb_cmdline_addr = 0;
+static uint32_t load_and_verify_vbmeta_addr = 0;
+static uint32_t fastboot_processor_addr = 0;
+
+__attribute__((used)) void spoof_lock_state(void) {
+    int spoofing = is_spoofing_enabled();
+
+    fastboot_publish("is-spoofing", spoofing ? "1" : "0");
+
+    if (spoofing) {
+        printf("[KAERU] Bootloader lock status spoofing: ENABLED\n");
+
+        // 1. Force seccfg_get_lock_state to return LKS_LOCK (1) to Android OS
+        if (seccfg_addr) {
+            PATCH_MEM(seccfg_addr + 6,
+                      0x2301,  // movs r3, #1 (LKS_LOCK)
+                      0x6023,  // str r3, [r4, #0]
+                      0x2000,  // movs r0, #0 (Success status)
+                      0xbd10   // pop {r4, pc}
+            );
+        }
+
+        // 2. Force AVB cmdline to always report "locked" to Android OS
+        if (avb_cmdline_addr) {
+            NOP(avb_cmdline_addr + 0x9C, 2); // NOP the beq.n branch
+        }
+
+        // 3. Remove fastboot lock/security constraints (from 0x4C42B830 base)
+        if (fastboot_processor_addr) {
+            NOP(fastboot_processor_addr + 0xFE, 1);  // NOP cbz r0, 0x4c42b978
+            NOP(fastboot_processor_addr + 0x12C, 1); // NOP cbz r0, 0x4c42b98a
+            NOP(fastboot_processor_addr + 0x16E, 2); // NOP bl fastboot_fail for "not support"
+            NOP(fastboot_processor_addr + 0x17A, 2); // NOP bl fastboot_fail for "not allowed"
+        }
+
+        // 4. Bypass load_and_verify_vbmeta key verification
+        if (load_and_verify_vbmeta_addr) {
+            NOP(load_and_verify_vbmeta_addr, 2); // NOP bne.w error (0x4C464CF8)
+            PATCH_MEM(load_and_verify_vbmeta_addr + 0x72, 0x2301); // cmp r3, #0 -> movs r3, #1 (0x4C464D6A)
+        }
+    } else {
+        printf("[KAERU] Bootloader lock status spoofing: DISABLED\n");
+
+        // 1. Force seccfg_get_lock_state to return LKS_UNLOCK (2) (standard unlocked)
+        if (seccfg_addr) {
+            PATCH_MEM(seccfg_addr + 6,
+                      0x2302,  // movs r3, #2 (LKS_UNLOCK)
+                      0x6023,  // str r3, [r4, #0]
+                      0x2000,  // movs r0, #0 (Success status)
+                      0xbd10   // pop {r4, pc}
+            );
+        }
+    }
+}
+
+static void __attribute__((naked)) spoof_lock_state_hook(void) {
+    asm volatile(
+        "push {r0-r3, lr}\n"
+        "bl spoof_lock_state\n"
+        "pop {r0-r3, lr}\n"
+        "ldr ip, =0x4C400D41\n" // original tail-call target (Thumb mode)
+        "bx ip\n"
+    );
+}
+
 void board_early_init(void) {
     printf("Entering early init for Redmi 13C (gale)\n");
 
@@ -61,50 +127,49 @@ void board_early_init(void) {
         PATCH_MEM(addr, 0xF04F, 0x0301);
     }
 
-    // 4. Force seccfg_get_lock_state to return 2 (unlocked state) so
-    //    the internal bootloader allows flashing via fastboot.
-    addr = SEARCH_PATTERN(LK_START, LK_END, 0xB1D0, 0xB510, 0x4604, 0xF7FF, 0xFFDD);
-    if (addr) {
-        printf("Found seccfg_get_lock_state at 0x%08X\n", addr);
-        PATCH_MEM(addr + 6,
-                  0x2301,  // movs r3, #1
-                  0x6023,  // str r3, [r4, #0]
-                  0x2002,  // movs r0, #2
-                  0xbd10   // pop {r4, pc}
-        );
+    // Find VMAs of seccfg, AVB cmdline, fastboot, and vbmeta verification functions
+    seccfg_addr = SEARCH_PATTERN(LK_START, LK_END, 0xB1D0, 0xB510, 0x4604, 0xF7FF, 0xFFDD);
+    if (seccfg_addr) {
+        printf("Found seccfg_get_lock_state at 0x%08X\n", seccfg_addr);
     }
 
-    // 5. Force AVB cmdline to always report "locked" to Android OS so
-    //    Play Integrity / SafetyNet passes on normal boots.
-    addr = SEARCH_PATTERN(LK_START, LK_END, 0xE92D, 0x4FF0, 0x4691, 0xF102);
-    if (addr) {
-        printf("Found AVB cmdline function at 0x%08X\n", addr);
-        // NOP the beq.n branch that picks the actual device state,
-        // forcing libavb to always use the "locked" string.
-        NOP(addr + 0x9C, 1);
+    avb_cmdline_addr = SEARCH_PATTERN(LK_START, LK_END, 0xE92D, 0x4FF0, 0x4691, 0xF102);
+    if (avb_cmdline_addr) {
+        printf("Found AVB cmdline function at 0x%08X\n", avb_cmdline_addr);
     }
 
-    // 6. Hook cmdline_pre_process to restore unlocked state when booting
-    //    into recovery, so fastbootd and recovery tools allow flashing.
+    uint32_t fastboot_gate_addr = SEARCH_PATTERN(LK_START, LK_END, 0x493A, 0x9804, 0x4479, 0xF015);
+    if (fastboot_gate_addr) {
+        fastboot_processor_addr = fastboot_gate_addr - 0xC4;
+        printf("Found fastboot command processor at 0x%08X\n", fastboot_processor_addr);
+    }
+
+    load_and_verify_vbmeta_addr = SEARCH_PATTERN(LK_START, LK_END, 0xF47F, 0xAE6B, 0xE688, 0xF8DD);
+    if (load_and_verify_vbmeta_addr) {
+        printf("Found load_and_verify_vbmeta at 0x%08X\n", load_and_verify_vbmeta_addr);
+        
+        // Always bypass chained key length mismatch so it goes to memcmp path
+        PATCH_MEM(load_and_verify_vbmeta_addr - 0x32C, 0x429B); // cmp r2, r3 -> cmp r3, r3
+    }
+
+    // Hook env_init_done (VMA 0x4C4057FA) to run our dynamic spoofing logic
+    uint32_t storage_init_done_caller = SEARCH_PATTERN(LK_START, LK_END, 0xB00C, 0xE8BD, 0x41F0, 0xF7FB, 0xBAA1);
+    if (storage_init_done_caller) {
+        uint32_t hook_addr = storage_init_done_caller + 6;
+        printf("Found storage_init_done tail-call at 0x%08X, hooking...\n", hook_addr);
+        PATCH_BRANCH(hook_addr, (void *)spoof_lock_state_hook);
+    }
+
+    // Hook cmdline_pre_process to restore unlocked state when booting recovery
     addr = SEARCH_PATTERN(LK_START, LK_END, 0xE92D, 0x47F0, 0xF7FF, 0xFFA6);
     if (addr) {
         printf("Found cmdline_pre_process at 0x%08X\n", addr);
         PATCH_CALL(addr, (void *)handle_recovery_boot, TARGET_THUMB);
     }
 
-    // Publish spoofing status so users can query it via:
-    //   fastboot getvar is-spoofing
-    //
-    // NOTE: board_early_init runs before env is initialized, so
-    // is_spoofing_enabled() would always return 0 here (env not ready).
-    // Since gale patches seccfg_get_lock_state unconditionally, we just
-    // report "1" always. The oem bldr_spoof command can still toggle the
-    // env var for the cmdline hook (handle_recovery_boot) which runs later.
-    fastboot_publish("is-spoofing", "1");
-
     // Register custom fastboot command to toggle cmdline spoofing:
-    //   fastboot oem bldr_spoof enable   -> keep verifiedbootstate=green on OS
-    //   fastboot oem bldr_spoof disable  -> expose orange/unlocked to OS
+    //   fastboot oem bldr_spoof on   -> enable bootloader lock spoofing
+    //   fastboot oem bldr_spoof off  -> disable bootloader lock spoofing
     fastboot_register("oem bldr_spoof", cmd_spoof_bootloader_lock, 0);
 }
 
@@ -113,9 +178,7 @@ void board_late_init(void) {
 
     uint32_t addr = 0;
 
-    // Disable dm-verity corruption warning ("Your device is corrupt") that
-    // appears on boot when the bootloader is unlocked, to avoid the
-    // 5-second power-off delay and the scary red warning screen.
+    // Disable dm-verity corruption warning ("Your device is corrupt")
     addr = SEARCH_PATTERN(LK_START, LK_END, 0xB530, 0xB083, 0xAB02, 0x2200);
     if (addr) {
         printf("Found dm_verity_corruption at 0x%08X\n", addr);
@@ -123,5 +186,10 @@ void board_late_init(void) {
     }
 
     video_printf("\n[KAERU] Loaded on Redmi 13C (gale)!\n");
-    video_printf("[KAERU] Bootloader lock status spoofed!\n");
+    if (is_spoofing_enabled()) {
+        video_printf("[KAERU] Bootloader lock status spoofed!\n");
+    } else {
+        video_printf("[KAERU] Bootloader spoofing is disabled.\n");
+    }
 }
+

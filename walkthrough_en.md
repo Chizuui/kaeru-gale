@@ -58,22 +58,32 @@ I searched for all branch instructions `bl` that lead to the platform initializa
 
 ## 3. Customization & Spoofing (board-gale.c)
 
-All customization logic is placed in `board/xiaomi/board-gale.c`:
+All customization logic is placed in `board/xiaomi/board-gale.c`. Instead of unconditional early patches, we hook right after environment initialization (`env_init_done`) to apply patches dynamically depending on whether `is_spoofing_enabled()` is set to `1` or `0`.
 
-* **Disable Image Authentication (`get_vfy_policy`)**: Forces `0xB508, 0xF7FF, 0xFF63, 0xF3C0` to return `0`.
-* **Allow Flashing (`get_dl_policy`)**: Forces `0xB508, 0xF7FF, 0xFF5D, 0xF000` to return `0`.
-* **Allow AVB Errors (`avb_slot_verify`)**: Patches `0xF005, 0x0301, 0xF083, 0x0A01, 0x930D, 0x9B70` to force allow-error path.
-* **Lock Spoofing (`seccfg_get_lock_state`)**: Patches at `0x4C471120` to return `2` (Unlocked) so the internal bootloader allows fastboot flashing.
-* **AVB Cmdline Spoofing**: NOP-patches the `beq.n` at `0x4C462260 + 0x9C` in the AVB cmdline function — forces `verifiedbootstate=green` into the kernel cmdline on all normal boots (Play Integrity stays happy).
+### Hooking Env Init done
+Since the env variables are not initialized during `board_early_init`, we hook the tail-call in the storage initialization function (`0x4C4057FA`) using `PATCH_BRANCH` to jump to `spoof_lock_state_hook()`, which runs our dynamic configuration.
+
+### When Spoofing is ENABLED (`bldr_spoof` is "1")
+* **Lock Spoofing (`seccfg_get_lock_state`)**: Patches function body at `0x4C471120 + 6` to write `1` (Locked) to the pointer, spoofing lock status for TEE and Android OS.
+* **AVB Cmdline Spoofing**: NOP-patches the `beq.n` at `0x4C462260 + 0x9C` — forces `verifiedbootstate=green` into the kernel cmdline on all normal boots.
+* **Fastboot Constraints Bypass**: NOP-patches `cbz` gates and `bl fastboot_fail` instructions in the fastboot command processor (`0x4C42B830`) so that fastboot commands work normally even while the lock state reports "locked".
+* **AVB Chained Key Verification Bypass (`load_and_verify_vbmeta`)**: NOP-patches the `bne.w` error path branch at `0x4C464CF8` and patches `cmp r2, r3` to `cmp r3, r3` at `0x4C4649CC` (forcing length check to always pass) and `cmp r3, #0` to `movs r3, #1` at `0x4C464D6A` (forcing key trusted state). This allows booting unsigned modems/images.
+
+### When Spoofing is DISABLED (`bldr_spoof` is "0")
+* **Lock Spoofing (`seccfg_get_lock_state`)**: Patches function body to return `2` (Unlocked) so TEE, Android OS, and fastboot detect the device as fully unlocked.
+* **Other patches**: Bypassed so the device boots in its natural unlocked state.
 
 ---
 
 ## 4. Recovery Cmdline Spoofing
 
-For TWRP / fastbootd to correctly detect the device as **unlocked**, the kernel cmdline must be restored to the real unlocked state when booting into recovery.
+For TWRP / fastbootd to correctly detect the device as **unlocked** when spoofing is enabled, the kernel cmdline must be restored to the real unlocked state when booting into recovery.
 
 ### Strategy
-Inspired by `board-earth.c`: hook `cmdline_pre_process` via `PATCH_CALL`, then detect recovery mode inside the hook and overwrite the cmdline buffers.
+Hook `cmdline_pre_process` via `PATCH_CALL`. If `get_bootmode() == BOOTMODE_RECOVERY` and spoofing is enabled, `handle_recovery_boot()` replaces:
+- `androidboot.verifiedbootstate=green` → `orange`
+- `androidboot.secureboot=1` → `0`
+- `androidboot.vbmeta.device_state=locked` → `unlocked`
 
 ### Key Addresses (found via static analysis)
 
@@ -83,16 +93,10 @@ Inspired by `board-earth.c`: hook `cmdline_pre_process` via `PATCH_CALL`, then d
 | `g_cmdline` (CMDLINE1) | `0x4C579626` | Decoded PC-relative literal pool in cmdline builder |
 | Secondary cmdline (CMDLINE2) | `0x4C5795D8` | Adjacent literal pool in same function |
 
-### What `handle_recovery_boot()` does
-1. Checks `get_bootmode() == BOOTMODE_RECOVERY` and `is_spoofing_enabled()` — returns early on normal boots.
-2. Calls `patch_cmdline()` on both BSS buffers, replacing:
-   - `androidboot.verifiedbootstate=green` → `orange`
-   - `androidboot.secureboot=1` → `0`
-   - `androidboot.vbmeta.device_state=locked` → `unlocked`
-
 ---
 
-## 4. Rebuilding
+## 5. Rebuilding
 ```bash
 ./build.sh gale lk.img
 ```
+

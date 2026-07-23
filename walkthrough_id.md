@@ -58,22 +58,32 @@ Saya mencari semua instruksi lompatan `bl` yang menuju ke alamat inisialisasi pl
 
 ## 3. Kustomisasi & Spoofing (board-gale.c)
 
-Semua kode diletakkan pada berkas `board/xiaomi/board-gale.c`:
+Semua logika kustomisasi diletakkan di `board/xiaomi/board-gale.c`. Alih-alih menerapkan patch awal secara permanen (unconditional), kami memasang hook tepat setelah inisialisasi lingkungan selesai (`env_init_done`) untuk menerapkan patch secara dinamis bergantung pada nilai `is_spoofing_enabled()` (apakah `1` atau `0`).
 
-* **Bypass Keamanan Gambar (`get_vfy_policy`)**: Pola `0xB508, 0xF7FF, 0xFF63, 0xF3C0` dipaksa mengembalikan `0`.
-* **Bypass Batasan Flash (`get_dl_policy`)**: Pola `0xB508, 0xF7FF, 0xFF5D, 0xF000` dipaksa mengembalikan `0`.
-* **Bypass Kesalahan AVB (`avb_slot_verify`)**: Pola ditambal agar selalu lewati error-gate.
-* **Spoofing Lock State (`seccfg_get_lock_state`)**: Dipaksa mengembalikan `2` (Unlocked) agar flashing via fastboot diizinkan.
-* **Spoofing AVB Cmdline**: NOP di `0x4C462260 + 0x9C` memaksa kernel cmdline melaporkan `verifiedbootstate=green` pada boot normal (Play Integrity tetap jalan).
+### Hooking Env Init Done
+Karena variabel lingkungan belum siap selama `board_early_init`, kami memasang hook pada tail-call fungsi inisialisasi penyimpanan (`0x4C4057FA`) menggunakan `PATCH_BRANCH` untuk melompat ke `spoof_lock_state_hook()`, yang menjalankan konfigurasi dinamis kami.
+
+### Ketika Spoofing DIAKTIFKAN (`bldr_spoof` bernilai "1")
+* **Lock Spoofing (`seccfg_get_lock_state`)**: Menambal badan fungsi di `0x4C471120 + 6` agar menulis `1` (Locked) ke pointer, menyamarkan status penguncian untuk TEE dan OS Android.
+* **Spoofing AVB Cmdline**: Menambal NOP pada `beq.n` di `0x4C462260 + 0x9C` — memaksa `verifiedbootstate=green` ke dalam cmdline kernel pada boot normal.
+* **Bypass Batasan Fastboot**: Menambal NOP pada gerbang `cbz` dan instruksi `bl fastboot_fail` di pemroses perintah fastboot (`0x4C42B830`) agar perintah fastboot tetap bekerja normal meski status kunci dilaporkan sebagai "locked".
+* **Bypass Verifikasi Kunci Chained AVB (`load_and_verify_vbmeta`)**: Menambal NOP pada cabang error path `bne.w` di `0x4C464CF8`, menambal `cmp r2, r3` menjadi `cmp r3, r3` di `0x4C4649CC` (memaksa pengecekan panjang kunci selalu lolos), serta menambal `cmp r3, #0` menjadi `movs r3, #1` di `0x4C464D6A` (memaksa status kunci terpercaya). Ini memungkinkan mem-boot modem/image yang tidak ditandatangani.
+
+### Ketika Spoofing DINONAKTIFKAN (`bldr_spoof` bernilai "0")
+* **Lock Spoofing (`seccfg_get_lock_state`)**: Menambal badan fungsi untuk mengembalikan `2` (Unlocked) agar TEE, OS Android, dan fastboot mendeteksi perangkat sebagai tidak terkunci secara penuh.
+* **Patch Lainnya**: Dilewati sehingga perangkat berjalan pada kondisi unlocked bawaan yang asli.
 
 ---
 
 ## 4. Spoofing Cmdline untuk Recovery
 
-Agar TWRP / fastbootd dapat mendeteksi perangkat sebagai **unlocked**, cmdline kernel harus dikembalikan ke status unlocked asli saat booting ke recovery mode.
+Agar TWRP / fastbootd dapat mendeteksi perangkat sebagai **unlocked** saat spoofing aktif, cmdline kernel harus dikembalikan ke status unlocked asli saat booting ke recovery mode.
 
 ### Strategi
-Terinspirasi dari `board-earth.c`: hook `cmdline_pre_process` via `PATCH_CALL`, lalu deteksi recovery mode di dalam hook dan timpa buffer cmdline.
+Memasang hook pada `cmdline_pre_process` melalui `PATCH_CALL`. Jika `get_bootmode() == BOOTMODE_RECOVERY` dan spoofing aktif, `handle_recovery_boot()` akan mengganti:
+- `androidboot.verifiedbootstate=green` → `orange`
+- `androidboot.secureboot=1` → `0`
+- `androidboot.vbmeta.device_state=locked` → `unlocked`
 
 ### Alamat Kunci (dari analisis statis)
 
@@ -83,16 +93,10 @@ Terinspirasi dari `board-earth.c`: hook `cmdline_pre_process` via `PATCH_CALL`, 
 | `g_cmdline` (CMDLINE1) | `0x4C579626` | Decode literal pool PC-relative di cmdline builder |
 | Buffer cmdline ke-2 (CMDLINE2) | `0x4C5795D8` | Literal pool berdekatan di fungsi yang sama |
 
-### Yang dilakukan `handle_recovery_boot()`
-1. Memeriksa `get_bootmode() == BOOTMODE_RECOVERY` dan `is_spoofing_enabled()` — langsung keluar pada boot normal.
-2. Memanggil `patch_cmdline()` pada kedua buffer BSS, mengganti:
-   - `androidboot.verifiedbootstate=green` → `orange`
-   - `androidboot.secureboot=1` → `0`
-   - `androidboot.vbmeta.device_state=locked` → `unlocked`
-
 ---
 
-## 4. Build Ulang
+## 5. Build Ulang
 ```bash
 ./build.sh gale lk.img
 ```
+
